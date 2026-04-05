@@ -155,13 +155,17 @@ ${nums}`
   // ══════════════════
   // .poll <link> <option>
   // ══════════════════
-  if (cmd === '.poll') {
-    const link   = parts[1]
-    const option = parseInt(parts[2])
 
-    if (!link || isNaN(option) || option < 1) {
-      await respSock.sendMessage(from, {
-        text:
+// ══════════════════
+// .poll <link> <option>
+// ══════════════════
+if (cmd === '.poll') {
+  const link   = parts[1]
+  const option = parseInt(parts[2])
+
+  if (!link || isNaN(option) || option < 1) {
+    await respSock.sendMessage(from, {
+      text:
 `❌ *Wrong format!*
 
 *Usage:*
@@ -169,60 +173,49 @@ ${nums}`
 
 *Example:*
 \`.poll https://whatsapp.com/channel/xxx/yyy 2\``
-      }, { quoted: msg })
-      return
-    }
-
-    await respSock.sendMessage(from, {
-      text: `⏳ *Starting vote...*\n🔗 _Fetching poll info from channel..._`
     }, { quoted: msg })
+    return
+  }
 
-    const parsed = await parseChannelLink(respSock, link)
+  await respSock.sendMessage(from, {
+    text: `⏳ *Starting vote...*\n🔗 _Fetching poll info from channel..._`
+  }, { quoted: msg })
 
-    if (!parsed) {
-      await respSock.sendMessage(from, {
-        text: `❌ *Could not fetch poll!*\n_Make sure the link is a valid WhatsApp channel poll link._`
-      }, { quoted: msg })
-      return
-    }
+  const parsed = await parseChannelLink(respSock, link)
 
-    const { newsletterJid, serverId } = parsed
-    const optionIndex    = option - 1
-    const totalSessions  = sessions.size
-    const sockList       = [...sessions.values()]
-
+  if (!parsed) {
     await respSock.sendMessage(from, {
-      text: `✅ _Poll found!_\n🗳️ _Voting option *${option}* from *${totalSessions}* sessions..._\n⏱️ _5s delay between each_`
-    })
+      text: `❌ *Could not fetch poll!*\n_Make sure the link is a valid WhatsApp channel poll link._`
+    }, { quoted: msg })
+    return
+  }
 
-    let voteCount = 0
+  const { newsletterJid, serverId } = parsed
+  const optionIndex   = option - 1
+  const totalSessions = sessions.size
+  const sockList      = [...sessions.values()]
 
-    for (let i = 0; i < sockList.length; i++) {
-      const s = sockList[i]
-      try {
-        await s.sendMessage(newsletterJid, {
-          pollUpdate: {
-            key: {
-              remoteJid: newsletterJid,
-              id: serverId,
-              fromMe: false
-            },
-            vote: {
-              selectedOptions: [optionIndex]
-            }
-          }
-        })
-        voteCount++
-        totalVotes++
-        console.log(`[CMD] Poll vote ${voteCount}/${totalSessions}`)
-      } catch (e) {
-        console.error(`[CMD] Poll vote error [session ${i}]:`, e.message)
-      }
-      if (i < sockList.length - 1) await delay(5000)
+  await respSock.sendMessage(from, {
+    text: `✅ _Poll found!_\n🗳️ _Voting option *${option}* from *${totalSessions}* sessions..._\n⏱️ _5s delay between each_`
+  })
+
+  let voteCount = 0
+
+  for (let i = 0; i < sockList.length; i++) {
+    const s = sockList[i]
+    try {
+      await s.newsletterVotePoll(newsletterJid, serverId, [optionIndex])
+      voteCount++
+      totalVotes++
+      console.log(`[CMD] Poll vote ${voteCount}/${totalSessions}`)
+    } catch (e) {
+      console.error(`[CMD] Poll vote error [session ${i}]:`, e.message)
     }
+    if (i < sockList.length - 1) await delay(5000)
+  }
 
-    await respSock.sendMessage(from, {
-      text:
+  await respSock.sendMessage(from, {
+    text:
 `🗳️ *Voting Complete!*
 
 ✅ *Voted:* ${voteCount}/${totalSessions} sessions
@@ -230,10 +223,9 @@ ${nums}`
 ⏱️ _5s delay used between each_
 
 _Total votes ever: ${totalVotes}_`
-    }, { quoted: msg })
-    return
+  }, { quoted: msg })
+  return
   }
-
   // ══════════════════
   // .react <link> <emoji>
   // ══════════════════
