@@ -16,11 +16,10 @@ const { handleCommand } = require('./commands')
 const SESSIONS_DIR = path.join(__dirname, '..', 'sessions')
 const logger = pino({ level: 'silent' })
 
-// Global maps - exported so other files can read them
-const sessions = new Map()   // number → sock
-const qrStore  = new Map()   // number → base64 QR
+const sessions = new Map()
+const qrStore  = new Map()
 
-// ── CREATE / RESTORE A SESSION ──
+// ── CREATE / RESTORE A SESSION (QR flow) ──
 async function createSession(number) {
   if (sessions.has(number)) {
     console.log(`[SESSION] Already connected: ${number}`)
@@ -31,19 +30,20 @@ async function createSession(number) {
   if (!fs.existsSync(sessDir)) fs.mkdirSync(sessDir, { recursive: true })
 
   const { state, saveCreds } = await useMultiFileAuthState(sessDir)
-  const { version } = await fetchLatestBaileysVersion()
+  const version = [2, 3000, 1015901307]
 
   const sock = makeWASocket({
     version,
     auth: state,
     logger,
     printQRInTerminal: false,
-    browser: ['VOTER Bot', 'Chrome', '20.0.04'],
+    browser: ['Ubuntu', 'Chrome', '134.0.0'],
     connectTimeoutMs: 60000,
-    defaultQueryTimeoutMs: 0,
-    keepAliveIntervalMs: 10000,
+    defaultQueryTimeoutMs: 60000,
+    keepAliveIntervalMs: 15000,
     markOnlineOnConnect: false,
-    syncFullHistory: false
+    syncFullHistory: false,
+    shouldSyncHistory: false
   })
 
   sock.ev.on('creds.update', saveCreds)
@@ -51,7 +51,6 @@ async function createSession(number) {
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update
 
-    // QR generated
     if (qr) {
       try {
         const base64 = await qrcode.toDataURL(qr)
@@ -62,14 +61,12 @@ async function createSession(number) {
       }
     }
 
-    // Connected
     if (connection === 'open') {
       console.log(`[SESSION] ✅ Connected: ${number}`)
       sessions.set(number, sock)
       qrStore.delete(number)
     }
 
-    // Disconnected
     if (connection === 'close') {
       const code = new Boom(lastDisconnect?.error)?.output?.statusCode
       console.log(`[SESSION] ❌ Disconnected: ${number} code=${code}`)
@@ -77,17 +74,15 @@ async function createSession(number) {
 
       if (code !== DisconnectReason.loggedOut) {
         console.log(`[SESSION] 🔄 Reconnecting: ${number}`)
-        await delay(4000)
+        await delay(5000)
         createSession(number)
       } else {
-        // Logged out — delete session files
         console.log(`[SESSION] 🚫 Logged out, removing: ${number}`)
         fs.rmSync(sessDir, { recursive: true, force: true })
       }
     }
   })
 
-  // Listen for commands on every message
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     if (type !== 'notify') return
     for (const msg of messages) {
@@ -106,88 +101,109 @@ async function createSession(number) {
 // ── PAIRING CODE FLOW ──
 async function createSessionWithPairing(number) {
   if (sessions.has(number)) {
-    throw new Error('Number already connected!')
+    throw new Error(`Number ${number} already connected!`)
   }
 
-  const sessDir = path.join(SESSIONS_DIR, number)
+  const cleanNumber = number.replace(/[^0-9]/g, '')
+
+  const sessDir = path.join(SESSIONS_DIR, cleanNumber)
   if (!fs.existsSync(sessDir)) fs.mkdirSync(sessDir, { recursive: true })
 
   const { state, saveCreds } = await useMultiFileAuthState(sessDir)
-  const { version } = await fetchLatestBaileysVersion()
+  const version = [2, 3000, 1015901307]
 
   const sock = makeWASocket({
     version,
     auth: state,
     logger,
     printQRInTerminal: false,
-    browser: ['VOTER Bot', 'Chrome', '20.0.04'],
+    browser: ['Ubuntu', 'Chrome', '134.0.0'],
     connectTimeoutMs: 60000,
-    defaultQueryTimeoutMs: 0,
-    keepAliveIntervalMs: 10000,
+    defaultQueryTimeoutMs: 60000,
+    keepAliveIntervalMs: 15000,
     markOnlineOnConnect: false,
-    syncFullHistory: false
+    syncFullHistory: false,
+    shouldSyncHistory: false
   })
 
   sock.ev.on('creds.update', saveCreds)
 
-  let pairCode = null
-  let codeDone = false
+  let pairingCode = null
+  let isPairingRequested = false
 
   sock.ev.on('connection.update', async (update) => {
-    const { connection, lastDisconnect } = update
+    const { connection, lastDisconnect, qr } = update
 
-    // Request pairing code once
-    if (!codeDone && !sock.authState.creds.registered) {
-      codeDone = true
-      await delay(1500)
+    if (!isPairingRequested && !sock.authState.creds.registered && (qr || connection === 'connecting')) {
+      isPairingRequested = true
+      console.log(`[SESSION] Requesting pairing code for ${cleanNumber}`)
+
+      await delay(5000)
+
       try {
-        pairCode = await sock.requestPairingCode(number)
-        console.log(`[SESSION] Pair code for ${number}: ${pairCode}`)
+        pairingCode = await sock.requestPairingCode(cleanNumber)
+        console.log(`[SESSION] ✅ Pairing code for ${cleanNumber}: ${pairingCode}`)
       } catch (e) {
-        console.error('[SESSION] requestPairingCode error:', e.message)
+        console.error(`[SESSION] requestPairingCode failed:`, e.message)
+        if (e.output?.statusCode === 428 || e.message.includes('Connection Closed')) {
+          console.log('[SESSION] Retrying pairing after delay...')
+          await delay(8000)
+          isPairingRequested = false
+        }
       }
     }
 
     if (connection === 'open') {
-      console.log(`[SESSION] ✅ Paired: ${number}`)
-      sessions.set(number, sock)
+      console.log(`[SESSION] ✅ Paired: ${cleanNumber}`)
+      sessions.set(cleanNumber, sock)
+      qrStore.delete(cleanNumber)
 
-      // Attach command listener after pairing
-      sock.ev.on('messages.upsert', async ({ messages, type }) => {
-        if (type !== 'notify') return
-        for (const msg of messages) {
-          try {
-            await handleCommand(msg, sock, sessions)
-          } catch (e) {
-            console.error('[SESSION] handleCommand error:', e.message)
+      if (!sock.listeners('messages.upsert').length) {
+        sock.ev.on('messages.upsert', async ({ messages, type }) => {
+          if (type !== 'notify') return
+          for (const msg of messages) {
+            try {
+              await handleCommand(msg, sock, sessions)
+            } catch (e) {
+              console.error('[COMMAND] Error:', e.message)
+            }
           }
-        }
-      })
+        })
+      }
     }
 
     if (connection === 'close') {
-      const code = new Boom(lastDisconnect?.error)?.output?.statusCode
-      sessions.delete(number)
-      if (code !== DisconnectReason.loggedOut) {
-        await delay(4000)
-        createSession(number)
+      const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode
+      console.log(`[SESSION] Disconnected ${cleanNumber} | code=${statusCode}`)
+      sessions.delete(cleanNumber)
+
+      if (statusCode !== DisconnectReason.loggedOut) {
+        console.log(`[SESSION] 🔄 Reconnecting in 5s...`)
+        await delay(5000)
+        createSession(cleanNumber)
       } else {
+        console.log(`[SESSION] 🚫 Logged out - cleaning session`)
         fs.rmSync(sessDir, { recursive: true, force: true })
       }
     }
   })
 
-  // Wait up to 20s for pairing code
-  for (let i = 0; i < 40; i++) {
-    await delay(500)
-    if (pairCode) break
-  }
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      reject(new Error('Pairing code timeout after 30s. Try again or use QR.'))
+    }, 30000)
 
-  if (!pairCode) throw new Error('Could not generate pairing code. Try again.')
-  return pairCode
+    const checkInterval = setInterval(() => {
+      if (pairingCode) {
+        clearTimeout(timeout)
+        clearInterval(checkInterval)
+        resolve(pairingCode)
+      }
+    }, 800)
+  })
 }
 
-// ── RESTORE ALL SAVED SESSIONS ON STARTUP ──
+// ── RESTORE ALL SESSIONS ON STARTUP ──
 async function restoreAllSessions() {
   if (!fs.existsSync(SESSIONS_DIR)) {
     fs.mkdirSync(SESSIONS_DIR, { recursive: true })
