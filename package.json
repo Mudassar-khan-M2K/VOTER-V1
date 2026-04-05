@@ -1,0 +1,22 @@
+{
+  "name": "voter-bot",
+  "version": "1.0.0",
+  "description": "VOTER - Multi-Session WhatsApp Poll & Reaction Bot by Mudassar Khan",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.9",
+    "@hapi/boom": "^10.0.1",
+    "express": "^4.18.2",
+    "pino": "^8.19.0",
+    "qrcode": "^1.5.3"
+  },
+  "author": "Mudassar Khan",
+  "license": "ISC"
+}
