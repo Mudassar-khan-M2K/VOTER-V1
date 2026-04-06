@@ -1,24 +1,41 @@
 const {
   default: makeWASocket,
-  useMultiFileAuthState,
   DisconnectReason,
   delay,
   fetchLatestBaileysVersion
 } = require('@whiskeysockets/baileys')
 
-const { Boom } = require('@hapi/boom')
-const pino = require('pino')
-const fs = require('fs')
-const path = require('path')
-const qrcode = require('qrcode')
-const { handleCommand } = require('./commands')
+const { useMongoDBAuthState } = require('mongo-baileys')
+const { MongoClient }         = require('mongodb')
+const { Boom }                = require('@hapi/boom')
+const pino                    = require('pino')
+const qrcode                  = require('qrcode')
+const { handleCommand }       = require('./commands')
 
-const SESSIONS_DIR = path.join(__dirname, '..', 'sessions')
 const logger = pino({ level: 'silent' })
 
-// Global maps - exported so other files can read them
-const sessions = new Map()   // number → sock
-const qrStore  = new Map()   // number → base64 QR
+// Global maps
+const sessions = new Map()  // number → sock
+const qrStore  = new Map()  // number → base64 QR
+
+// ── MONGODB CONNECTION ──
+let mongoClient = null
+let db          = null
+
+async function connectMongo() {
+  if (db) return db
+  mongoClient = new MongoClient(process.env.MONGODB_URI)
+  await mongoClient.connect()
+  db = mongoClient.db('voterbot')
+  console.log('[MONGO] ✅ Connected to MongoDB Atlas')
+  return db
+}
+
+// ── GET MONGO COLLECTION FOR A NUMBER ──
+async function getAuthCollection(number) {
+  const database = await connectMongo()
+  return database.collection(`session_${number}`)
+}
 
 // ── CREATE / RESTORE A SESSION ──
 async function createSession(number) {
@@ -27,23 +44,21 @@ async function createSession(number) {
     return sessions.get(number)
   }
 
-  const sessDir = path.join(SESSIONS_DIR, number)
-  if (!fs.existsSync(sessDir)) fs.mkdirSync(sessDir, { recursive: true })
-
-  const { state, saveCreds } = await useMultiFileAuthState(sessDir)
-  const { version } = await fetchLatestBaileysVersion()
+  const collection            = await getAuthCollection(number)
+  const { state, saveCreds }  = await useMongoDBAuthState(collection)
+  const { version }           = await fetchLatestBaileysVersion()
 
   const sock = makeWASocket({
     version,
-    auth: state,
+    auth              : state,
     logger,
-    printQRInTerminal: false,
-    browser: ['VOTER Bot', 'Chrome', '20.0.04'],
-    connectTimeoutMs: 60000,
-    defaultQueryTimeoutMs: 0,
-    keepAliveIntervalMs: 10000,
-    markOnlineOnConnect: false,
-    syncFullHistory: false
+    printQRInTerminal : false,
+    browser           : ['VOTER Bot', 'Chrome', '20.0.04'],
+    connectTimeoutMs  : 60000,
+    defaultQueryTimeoutMs : 0,
+    keepAliveIntervalMs   : 10000,
+    markOnlineOnConnect   : false,
+    syncFullHistory       : false
   })
 
   sock.ev.on('creds.update', saveCreds)
@@ -80,14 +95,15 @@ async function createSession(number) {
         await delay(4000)
         createSession(number)
       } else {
-        // Logged out — delete session files
+        // Logged out — drop mongo collection
         console.log(`[SESSION] 🚫 Logged out, removing: ${number}`)
-        fs.rmSync(sessDir, { recursive: true, force: true })
+        const col = await getAuthCollection(number)
+        await col.drop().catch(() => {})
       }
     }
   })
 
-  // Listen for commands on every message
+  // Listen for commands
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     if (type !== 'notify') return
     for (const msg of messages) {
@@ -109,23 +125,21 @@ async function createSessionWithPairing(number) {
     throw new Error('Number already connected!')
   }
 
-  const sessDir = path.join(SESSIONS_DIR, number)
-  if (!fs.existsSync(sessDir)) fs.mkdirSync(sessDir, { recursive: true })
-
-  const { state, saveCreds } = await useMultiFileAuthState(sessDir)
-  const { version } = await fetchLatestBaileysVersion()
+  const collection            = await getAuthCollection(number)
+  const { state, saveCreds }  = await useMongoDBAuthState(collection)
+  const { version }           = await fetchLatestBaileysVersion()
 
   const sock = makeWASocket({
     version,
-    auth: state,
+    auth              : state,
     logger,
-    printQRInTerminal: false,
-    browser: ['VOTER Bot', 'Chrome', '20.0.04'],
-    connectTimeoutMs: 60000,
-    defaultQueryTimeoutMs: 0,
-    keepAliveIntervalMs: 10000,
-    markOnlineOnConnect: false,
-    syncFullHistory: false
+    printQRInTerminal : false,
+    browser           : ['VOTER Bot', 'Chrome', '20.0.04'],
+    connectTimeoutMs  : 60000,
+    defaultQueryTimeoutMs : 0,
+    keepAliveIntervalMs   : 10000,
+    markOnlineOnConnect   : false,
+    syncFullHistory       : false
   })
 
   sock.ev.on('creds.update', saveCreds)
@@ -152,7 +166,6 @@ async function createSessionWithPairing(number) {
       console.log(`[SESSION] ✅ Paired: ${number}`)
       sessions.set(number, sock)
 
-      // Attach command listener after pairing
       sock.ev.on('messages.upsert', async ({ messages, type }) => {
         if (type !== 'notify') return
         for (const msg of messages) {
@@ -172,7 +185,8 @@ async function createSessionWithPairing(number) {
         await delay(4000)
         createSession(number)
       } else {
-        fs.rmSync(sessDir, { recursive: true, force: true })
+        const col = await getAuthCollection(number)
+        await col.drop().catch(() => {})
       }
     }
   })
@@ -187,26 +201,28 @@ async function createSessionWithPairing(number) {
   return pairCode
 }
 
-// ── RESTORE ALL SAVED SESSIONS ON STARTUP ──
+// ── RESTORE ALL SESSIONS FROM MONGODB ON STARTUP ──
 async function restoreAllSessions() {
-  if (!fs.existsSync(SESSIONS_DIR)) {
-    fs.mkdirSync(SESSIONS_DIR, { recursive: true })
-    return
-  }
+  try {
+    const database    = await connectMongo()
+    const collections = await database.listCollections().toArray()
+    const sessCols    = collections
+      .map(c => c.name)
+      .filter(n => n.startsWith('session_'))
 
-  const folders = fs.readdirSync(SESSIONS_DIR).filter(f =>
-    fs.statSync(path.join(SESSIONS_DIR, f)).isDirectory()
-  )
+    console.log(`[SESSION] Restoring ${sessCols.length} session(s) from MongoDB...`)
 
-  console.log(`[SESSION] Restoring ${folders.length} session(s)...`)
-
-  for (const num of folders) {
-    try {
-      await createSession(num)
-      await delay(2500)
-    } catch (e) {
-      console.error(`[SESSION] Failed to restore ${num}:`, e.message)
+    for (const colName of sessCols) {
+      const number = colName.replace('session_', '')
+      try {
+        await createSession(number)
+        await delay(2500)
+      } catch (e) {
+        console.error(`[SESSION] Failed to restore ${number}:`, e.message)
+      }
     }
+  } catch (e) {
+    console.error('[MONGO] restoreAllSessions error:', e.message)
   }
 }
 
