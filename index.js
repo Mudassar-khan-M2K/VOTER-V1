@@ -1,7 +1,7 @@
 const express = require('express')
 const path    = require('path')
 
-const { sessions, qrStore, createSessionWithPairing, createSession, restoreAllSessions } = require('./handlers/session')
+const { sessions, qrStore, connectMongo, createSessionWithPairing, createSession, restoreAllSessions } = require('./handlers/session')
 const { getStats } = require('./handlers/commands')
 
 const app = express()
@@ -12,7 +12,6 @@ app.use(express.static(path.join(__dirname, 'web')))
 //  API ROUTES
 // ══════════════════════════════
 
-// GET  /api/stats — active sessions count, votes, reacts, numbers
 app.get('/api/stats', (req, res) => {
   const { totalVotes, totalReacts } = getStats()
   res.json({
@@ -23,7 +22,6 @@ app.get('/api/stats', (req, res) => {
   })
 })
 
-// POST /api/pair — get pairing code for a number
 app.post('/api/pair', async (req, res) => {
   const { number } = req.body
   if (!number) return res.json({ error: 'Number is required' })
@@ -40,7 +38,6 @@ app.post('/api/pair', async (req, res) => {
   }
 })
 
-// POST /api/qr — generate QR for a number
 app.post('/api/qr', async (req, res) => {
   const { number } = req.body
   if (!number) return res.json({ error: 'Number is required' })
@@ -52,9 +49,8 @@ app.post('/api/qr', async (req, res) => {
 
   try {
     qrStore.delete(clean)
-    createSession(clean) // don't await — let it run in background
+    createSession(clean).catch(console.error)
 
-    // Wait up to 20s for QR to be generated
     for (let i = 0; i < 40; i++) {
       await new Promise(r => setTimeout(r, 500))
       if (qrStore.has(clean)) break
@@ -72,7 +68,6 @@ app.post('/api/qr', async (req, res) => {
   }
 })
 
-// Serve dashboard for any unknown route
 app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, 'web', 'index.html'))
 })
@@ -84,9 +79,10 @@ const PORT = process.env.PORT || 3000
 
 app.listen(PORT, async () => {
   console.log('╔══════════════════════════════╗')
-  console.log('║   🗳️  VOTER BOT  v1.0                     ║')
+  console.log('║   🗳️  VOTER BOT  v1.0         ║')
   console.log('╚══════════════════════════════╝')
   console.log(`🌐  Dashboard : http://localhost:${PORT}`)
   console.log(`👨‍💻  Dev       : Mudassar Khan — Mianwali, PK\n`)
-  await restoreAllSessions()
+  await connectMongo()        // ← pehle MongoDB connect
+  await restoreAllSessions()  // ← phir sessions restore
 })
